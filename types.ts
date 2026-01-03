@@ -49,6 +49,8 @@ export interface GameEntity {
   targetId?: string;
   faction?: number;
   isVisible?: boolean; 
+  // Added personality to GameEntity for AI entities
+  personality?: { aggro: number; chaseBudget: number; fleeMargin: number; riskAversion: number };
 }
 
 export interface Biome {
