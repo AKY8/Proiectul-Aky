@@ -33,8 +33,11 @@ export type AIBehavior = 'flee' | 'hunt' | 'idle' | 'ambush' | 'team';
 export interface GameEntity {
   id: string;
   type: 'player' | 'ai' | 'food' | 'hazard' | 'virus' | 'ejected';
-  ownerId?: string; // For split cells and ejected mass
-  mergeTimer?: number; // Ticks until this cell can merge with siblings
+  ownerId?: string;
+  mergeTimer?: number;
+  spawnTime?: number; // performance.now() at creation
+  vx?: number; // Velocity X for ejected mass/splits
+  vy?: number; // Velocity Y for ejected mass/splits
   x: number;
   y: number;
   radius: number;

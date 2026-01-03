@@ -47,12 +47,33 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({ player, engineRef, biome
     const avgX = playerCells.reduce((sum, c) => sum + (c.x * c.mass), 0) / totalMass;
     const avgY = playerCells.reduce((sum, c) => sum + (c.y * c.mass), 0) / totalMass;
 
-    cam.current.x += (avgX - cam.current.x) * 0.15;
-    cam.current.y += (avgY - cam.current.y) * 0.15;
+    // Improved responsiveness: 0.22 provides a tighter follow without jitter
+    cam.current.x += (avgX - cam.current.x) * 0.22;
+    cam.current.y += (avgY - cam.current.y) * 0.22;
 
-    // Zoom out as total mass increases
-    const targetZoom = Math.max(0.08, Math.min(0.8, 120 / (Math.sqrt(totalMass) + 60)));
-    cam.current.zoom += (targetZoom - cam.current.zoom) * 0.05;
+    // Dynamic Zoom Calculation
+    // 1. Calculate mass-based zoom base
+    const massZoom = Math.max(0.08, Math.min(0.8, 120 / (Math.sqrt(totalMass) + 60)));
+    
+    // 2. Calculate density-based adjustment (look further out if many entities are nearby)
+    let localEntityCount = 0;
+    const detectionRadius = 1500;
+    for (let i = 0; i < entities.length; i++) {
+      const e = entities[i];
+      if (e.type === 'food') continue;
+      const dx = e.x - avgX;
+      const dy = e.y - avgY;
+      if (dx * dx + dy * dy < detectionRadius * detectionRadius) {
+        localEntityCount++;
+      }
+    }
+    
+    // Zoom out slightly more when in dense "combat" zones (high entity count)
+    const densityFactor = Math.max(0.7, 1 - (localEntityCount / 50) * 0.3);
+    const targetZoom = massZoom * densityFactor;
+    
+    // Smooth zoom transition
+    cam.current.zoom += (targetZoom - cam.current.zoom) * 0.04;
 
     const { width, height } = canvas;
     const z = cam.current.zoom;
@@ -110,7 +131,6 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({ player, engineRef, biome
       if (e.type === 'food' || e.x + e.radius < vX || e.x - e.radius > vX + vW || e.y + e.radius < vY || e.y - e.radius > vY + vH) continue;
 
       if (e.type === 'virus') {
-         // Spiky virus draw
          ctx.fillStyle = e.color;
          ctx.strokeStyle = '#166534';
          ctx.lineWidth = 4;

@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { GameCanvas } from './components/GameCanvas';
 import { Minimap } from './components/Minimap';
+import { ChatBot } from './components/ChatBot';
 import { PlayerState, CellClass, GameEntity, Biome } from './types';
 import { INITIAL_MASS, CLASS_DATA, MAP_SIZE, FOOD_COUNT, AI_COUNT } from './constants';
 import { GoogleGenAI } from "@google/genai";
@@ -14,6 +15,34 @@ const MIN_SPLIT_MASS = 35;
 const VIRUS_COUNT = 25;
 const MAX_PLAYER_CELLS = 16;
 const EJECT_COOLDOWN = 100;
+const REABSORB_COOLDOWN = 1200; 
+
+// Object Pool for Entities to reduce GC pressure
+class EntityPool {
+  private pool: GameEntity[] = [];
+
+  get(type: 'food' | 'ejected'): GameEntity {
+    if (this.pool.length > 0) {
+      const e = this.pool.pop()!;
+      e.type = type;
+      return e;
+    }
+    return { id: '', type, x: 0, y: 0, radius: 0, color: '', mass: 0 };
+  }
+
+  release(e: GameEntity) {
+    if (this.pool.length < 2000) {
+      // Reset critical properties
+      e.ownerId = undefined;
+      e.vx = undefined;
+      e.vy = undefined;
+      e.spawnTime = undefined;
+      this.pool.push(e);
+    }
+  }
+}
+
+const globalEntityPool = new EntityPool();
 
 class OptimizedGrid {
   cells: Int32Array[];
@@ -23,7 +52,7 @@ class OptimizedGrid {
   constructor() {
     this.cols = Math.ceil(MAP_SIZE / GRID_CELL_SIZE);
     const totalCells = this.cols * this.cols;
-    this.cells = Array.from({ length: totalCells }, () => new Int32Array(512)); 
+    this.cells = Array.from({ length: totalCells }, () => new Int32Array(1024)); 
     this.counts = new Int32Array(totalCells);
   }
 
@@ -35,7 +64,7 @@ class OptimizedGrid {
     const gx = Math.max(0, Math.min(this.cols - 1, (x / GRID_CELL_SIZE) | 0));
     const gy = Math.max(0, Math.min(this.cols - 1, (y / GRID_CELL_SIZE) | 0));
     const idx = gy * this.cols + gx;
-    if (this.counts[idx] < 512) {
+    if (this.counts[idx] < 1024) {
       this.cells[idx][this.counts[idx]++] = id;
     }
   }
@@ -78,12 +107,16 @@ const App: React.FC = () => {
   const lastTimeRef = useRef<number>(0);
   const accumulatorRef = useRef<number>(0);
   const lastEjectTime = useRef<number>(0);
+  const lastLeaderboardUpdate = useRef<number>(0);
   
   const [uiPlayer, setUiPlayer] = useState<PlayerState>({
     id: 'player', name: playerName, level: 1, exp: 0, maxExp: 100,
     class: CellClass.PREDATOR, mass: INITIAL_MASS,
     stats: CLASS_DATA[CellClass.PREDATOR].baseStats, skillPoints: 0, skills: []
   });
+
+  const uiPlayerRef = useRef(uiPlayer);
+  useEffect(() => { uiPlayerRef.current = uiPlayer; }, [uiPlayer]);
 
   const biomes = useMemo<Biome[]>(() => [
     { id: '1', name: 'Toxic Mire', color: '#10b981', bounds: { x: 500, y: 500, w: 2500, h: 2500 }, effect: 'toxic' },
@@ -94,57 +127,68 @@ const App: React.FC = () => {
   const requestAdvice = async () => {
     if (isThinking) return;
     setIsThinking(true);
-    setAdvisorMessage("Establishing encrypted tactical link...");
+    setAdvisorMessage("Initiating Deep Thinking Subroutines...");
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const response = await ai.models.generateContent({
         model: 'gemini-3-pro-preview',
-        contents: `CONTEXT:
-        Player: ${uiPlayer.name} (${uiPlayer.class})
-        Mass: ${Math.floor(uiPlayer.mass)} | Level: ${uiPlayer.level}
-        Arena: High-intensity split-physics environment.
-        Goal: Provide a brief, cool, RPG-styled tactical tip for survival and domination.
-        Max 18 words. AI Strategist tone.`,
+        contents: `CRITICAL STATUS: 
+        NAME: ${uiPlayerRef.current.name}
+        CLASS: ${uiPlayerRef.current.class}
+        CURRENT_MASS: ${Math.floor(uiPlayerRef.current.mass)}
+        LEVEL: ${uiPlayerRef.current.level}
+        
+        SITUATION: The player is in a high-stakes local arena. 
+        TASK: Think deeply about their current survival probability and provide one cryptic but useful tactical directive. 
+        TONE: Transhumanist AI Advisor. 15-20 words max.`,
         config: { thinkingConfig: { thinkingBudget: 32768 } },
       });
-      setAdvisorMessage(response.text?.trim() || "Consolidate biomass for dominance.");
+      setAdvisorMessage(response.text?.trim() || "Consolidate matter. Avoid dissipation.");
     } catch {
-      setAdvisorMessage("Link integrity compromised.");
+      setAdvisorMessage("Neural link timeout.");
     } finally {
       setIsThinking(false);
-      setTimeout(() => setAdvisorMessage(null), 15000);
+      setTimeout(() => setAdvisorMessage(null), 10000);
     }
   };
 
   const handleSplit = useCallback(() => {
     const { entities } = engineRef.current;
-    const playerCells = entities.filter(e => (e.ownerId === 'player' || e.id === 'player') && e.mass >= MIN_SPLIT_MASS);
-    if (playerCells.length === 0 || entities.filter(e => e.ownerId === 'player' || e.id === 'player').length >= MAX_PLAYER_CELLS) return;
+    const playerCells = entities.filter(e => (e.ownerId === 'player' || e.id === 'player'));
+    const eligibleCells = playerCells.filter(e => e.mass >= MIN_SPLIT_MASS);
+    
+    if (eligibleCells.length === 0) return;
+    let availableSplits = MAX_PLAYER_CELLS - playerCells.length;
+    if (availableSplits <= 0) return;
 
     const newCells: GameEntity[] = [];
-    playerCells.forEach(cell => {
+    eligibleCells.forEach(cell => {
+      if (availableSplits <= 0) return;
       const halfMass = cell.mass / 2;
       cell.mass = halfMass;
       cell.radius = Math.sqrt(cell.mass) * 4;
-      cell.mergeTimer = PHYSICS_TPS * 25; 
+      cell.mergeTimer = PHYSICS_TPS * 30; 
 
       const dx = mouseRef.current.x, dy = mouseRef.current.y;
-      const d = Math.sqrt(dx*dx + dy*dy) || 1;
+      const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
       
       newCells.push({
         id: `p-split-${Math.random()}`,
         type: 'player',
         ownerId: 'player',
-        x: cell.x + (dx / d) * (cell.radius * 0.6),
-        y: cell.y + (dy / d) * (cell.radius * 0.6),
+        x: cell.x + (dx / d) * (cell.radius * 0.8),
+        y: cell.y + (dy / d) * (cell.radius * 0.8),
+        vx: (dx / d) * 16,
+        vy: (dy / d) * 16,
         radius: cell.radius,
         mass: halfMass,
         color: cell.color,
         class: cell.class,
-        mergeTimer: PHYSICS_TPS * 25,
-        behavior: 'idle'
+        mergeTimer: PHYSICS_TPS * 30,
+        spawnTime: performance.now()
       });
+      availableSplits--;
     });
     engineRef.current.entities = [...entities, ...newCells];
   }, []);
@@ -154,217 +198,187 @@ const App: React.FC = () => {
     lastEjectTime.current = Date.now();
 
     const { entities } = engineRef.current;
-    const playerCells = entities.filter(e => (e.ownerId === 'player' || e.id === 'player') && e.mass > 45);
+    const playerCells = entities.filter(e => (e.ownerId === 'player' || e.id === 'player') && e.mass > 40);
     
-    const ejected: GameEntity[] = [];
+    const ejectedArr: GameEntity[] = [];
     playerCells.forEach(cell => {
       const ejectMass = 14;
       cell.mass -= ejectMass;
       cell.radius = Math.sqrt(cell.mass) * 4;
-
       const dx = mouseRef.current.x, dy = mouseRef.current.y;
-      const d = Math.sqrt(dx*dx + dy*dy) || 1;
+      const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
 
-      ejected.push({
-        id: `ej-${Math.random()}`,
-        type: 'ejected',
-        ownerId: 'player',
-        x: cell.x + (dx / d) * (cell.radius + 15),
-        y: cell.y + (dy / d) * (cell.radius + 15),
-        radius: 10,
-        mass: ejectMass,
-        color: cell.color
-      });
+      const e = globalEntityPool.get('ejected');
+      e.id = `ej-${Math.random()}`;
+      e.ownerId = 'player';
+      e.x = cell.x + (dx / d) * (cell.radius + 10);
+      e.y = cell.y + (dy / d) * (cell.radius + 10);
+      e.vx = (dx / d) * 13;
+      e.vy = (dy / d) * 13;
+      e.radius = 10;
+      e.mass = ejectMass;
+      e.color = cell.color;
+      e.spawnTime = performance.now();
+      
+      ejectedArr.push(e);
     });
-    engineRef.current.entities = [...entities, ...ejected];
+    engineRef.current.entities = [...entities, ...ejectedArr];
   }, []);
-
-  useEffect(() => {
-    const handleKeys = (e: KeyboardEvent) => {
-      if (gameState !== 'playing') return;
-      if (e.code === 'Space') { e.preventDefault(); handleSplit(); }
-      if (e.code === 'KeyW') { e.preventDefault(); handleEject(); }
-    };
-    window.addEventListener('keydown', handleKeys);
-    return () => window.removeEventListener('keydown', handleKeys);
-  }, [gameState, handleSplit, handleEject]);
-
-  const initWorld = (selectedClass: CellClass) => {
-    const ents: GameEntity[] = [];
-    ents.push({
-      id: 'player', type: 'player', x: MAP_SIZE / 2, y: MAP_SIZE / 2,
-      radius: Math.sqrt(INITIAL_MASS) * 4, color: CLASS_DATA[selectedClass].color,
-      mass: INITIAL_MASS, class: selectedClass, mergeTimer: 0
-    });
-    for (let i = 0; i < FOOD_COUNT; i++) {
-      ents.push({ id: `f-${i}`, type: 'food', x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, radius: 3, color: '#475569', mass: 1 });
-    }
-    for (let i = 0; i < AI_COUNT; i++) {
-      const cls = Object.values(CellClass)[Math.floor(Math.random() * 5)] as CellClass;
-      ents.push({ id: `ai-${i}`, type: 'ai', x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, radius: 20, color: CLASS_DATA[cls].color, mass: 60 + Math.random() * 400, class: cls });
-    }
-    for (let i = 0; i < VIRUS_COUNT; i++) {
-      ents.push({ id: `v-${i}`, type: 'virus', x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, radius: 65, color: '#22c55e', mass: 100 });
-    }
-    engineRef.current = { entities: ents, playerIdx: 0 };
-  };
 
   const runPhysicsTick = useCallback(() => {
     const { entities } = engineRef.current;
     const playerCells = entities.filter(e => e.ownerId === 'player' || e.id === 'player');
-    if (playerCells.length === 0) return;
+    if (playerCells.length === 0 && gameState === 'playing') return;
+
+    const now = performance.now();
 
     for (let i = 0; i < entities.length; i++) {
       const e = entities[i];
       if (e.type === 'food' || e.type === 'virus') continue;
-      
       const stats = e.class ? CLASS_DATA[e.class].baseStats : { speed: 1 };
       const baseSpeed = (stats.speed * 8.5) / (1 + Math.sqrt(e.mass) / 11);
-      const speedMult = e.type === 'ejected' ? 14 : baseSpeed;
 
-      if (e.ownerId === 'player' || e.id === 'player') {
+      if (e.type === 'ejected') {
+        e.x += e.vx || 0; e.y += e.vy || 0;
+        if (e.vx) e.vx *= 0.92; if (e.vy) e.vy *= 0.92;
+      } else if (e.ownerId === 'player' || e.id === 'player') {
         const dx = mouseRef.current.x, dy = mouseRef.current.y;
-        const d = Math.sqrt(dx*dx + dy*dy);
-        if (d > 5) {
-          e.x += (dx / d) * speedMult;
-          e.y += (dy / d) * speedMult;
-        }
+        const d = Math.sqrt(dx*dx + dy*dy) || 0.001;
+        e.x += (e.vx || 0); e.y += (e.vy || 0);
+        if (e.vx) e.vx *= 0.85; if (e.vy) e.vy *= 0.85;
+        if (d > 5) { e.x += (dx / d) * baseSpeed; e.y += (dy / d) * baseSpeed; }
         if (e.mergeTimer && e.mergeTimer > 0) e.mergeTimer--;
 
         for(let j=0; j<entities.length; j++) {
             const other = entities[j];
             if (i === j || (other.ownerId !== 'player' && other.id !== 'player')) continue;
-            const isMerging = (e.mergeTimer === 0 && other.mergeTimer === 0);
-            if (!isMerging) {
-                const dx = e.x - other.x;
-                const dy = e.y - other.y;
-                const dist = Math.sqrt(dx*dx + dy*dy);
-                const min = e.radius + other.radius;
-                if (dist < min) {
-                    const force = (min - dist) * 0.12;
-                    const ax = (dx / dist) * force;
-                    const ay = (dy / dist) * force;
-                    e.x += ax; e.y += ay;
-                    other.x -= ax; other.y -= ay;
-                }
+            if (e.mergeTimer === 0 && other.mergeTimer === 0) continue;
+            const dxSibling = e.x - other.x; const dySibling = e.y - other.y;
+            const dist = Math.sqrt(dxSibling*dxSibling + dySibling*dySibling) || 0.001;
+            const min = e.radius + other.radius;
+            if (dist < min) {
+                const force = (min - dist) * 0.15;
+                e.x += (dxSibling / dist) * force; e.y += (dySibling / dist) * force;
+                other.x -= (dxSibling / dist) * force; other.y -= (dySibling / dist) * force;
             }
         }
       } else if (e.type === 'ai') {
         const target = playerCells[0];
-        const dist = Math.hypot(target.x - e.x, target.y - e.y);
-        if (dist < 2200) {
-          const angle = Math.atan2(target.y - e.y, target.x - e.x);
-          const factor = e.mass > target.mass * 1.25 ? 0.7 : -0.95;
-          e.x += Math.cos(angle) * speedMult * factor;
-          e.y += Math.sin(angle) * speedMult * factor;
+        if (target) {
+          const dist = Math.hypot(target.x - e.x, target.y - e.y) || 0.001;
+          if (dist < 2200) {
+            const factor = e.mass > target.mass * 1.25 ? 0.7 : -1;
+            e.x += ((target.x - e.x) / dist) * baseSpeed * factor;
+            e.y += ((target.y - e.y) / dist) * baseSpeed * factor;
+          }
         }
       }
-      e.x = Math.max(0, Math.min(MAP_SIZE, e.x));
-      e.y = Math.max(0, Math.min(MAP_SIZE, e.y));
-      e.radius = Math.sqrt(e.mass) * 4;
-      e.mass *= 0.99998; 
+      e.x = Math.max(0, Math.min(MAP_SIZE, e.x)); e.y = Math.max(0, Math.min(MAP_SIZE, e.y));
+      e.radius = Math.sqrt(e.mass) * 4; e.mass *= 0.99999; 
     }
 
     gridRef.current.clear();
-    for(let i=0; i<entities.length; i++) {
-      gridRef.current.insert(entities[i].x, entities[i].y, i);
-    }
+    for(let i=0; i<entities.length; i++) gridRef.current.insert(entities[i].x, entities[i].y, i);
 
     const deadSet = new Set<number>();
     const additions: GameEntity[] = [];
     let xpGain = 0;
-    let totalMassAccum = 0;
+    let playerMassSum = 0;
 
     for (let i = 0; i < entities.length; i++) {
       const a = entities[i];
       if (deadSet.has(i)) continue;
-      if (a.ownerId === 'player' || a.id === 'player') totalMassAccum += a.mass;
+      const isPlayer = a.ownerId === 'player' || a.id === 'player';
+      if (isPlayer) playerMassSum += a.mass;
+      if (a.type !== 'player' && a.type !== 'ai' && a.type !== 'virus') continue;
 
       const nearby = gridRef.current.getNearby(a.x, a.y, a.radius);
       for (const j of nearby) {
         if (i === j || deadSet.has(j)) continue;
         const b = entities[j];
-        const distSq = (a.x - b.x)**2 + (a.y - b.y)**2;
+        const dxCons = a.x - b.x; const dyCons = a.y - b.y;
+        const distSq = dxCons*dxCons + dyCons*dyCons;
         
         if (a.type === 'virus' && b.type === 'ejected') {
            if (distSq < (a.radius + b.radius)**2) {
-             a.mass += b.mass;
-             deadSet.add(j);
+             a.mass += b.mass; deadSet.add(j);
              if (a.mass > 210) {
+                const dist = Math.sqrt(dxCons*dxCons + dyCons*dyCons) || 0.001;
                 a.mass = 100;
-                additions.push({ id: `v-${Math.random()}`, type: 'virus', x: a.x + 100, y: a.y + 100, radius: 65, mass: 100, color: a.color });
+                additions.push({ id: `v-${Math.random()}`, type: 'virus', x: a.x - (dxCons/dist)*150, y: a.y - (dyCons/dist)*150, radius: 65, mass: 100, color: a.color });
              }
            }
            continue;
         }
 
-        if (distSq < (a.radius * 0.92)**2) {
-          if (b.type === 'virus' && a.mass > b.mass * 1.3 && (a.id === 'player' || a.ownerId === 'player')) {
+        if (distSq < (a.radius * 0.94)**2) {
+          if (b.type === 'virus' && a.mass > b.mass * 1.3 && isPlayer) {
              deadSet.add(j); 
-             const fragments = Math.min(14, Math.floor(a.mass / 22));
-             const fragMass = a.mass / fragments;
-             a.mass = fragMass;
+             const fragments = Math.min(14, Math.floor(a.mass / 20));
+             const fMass = a.mass / fragments;
+             a.mass = fMass;
              for(let k=0; k<fragments-1; k++) {
+                const angle = Math.random() * Math.PI * 2;
                 additions.push({
                    id: `split-v-${Math.random()}`, type: 'player', ownerId: 'player',
-                   x: a.x + (Math.random() - 0.5) * 180, y: a.y + (Math.random() - 0.5) * 180,
-                   radius: Math.sqrt(fragMass)*4, mass: fragMass, color: a.color, mergeTimer: PHYSICS_TPS * 30
+                   x: a.x, y: a.y, vx: Math.cos(angle) * 14, vy: Math.sin(angle) * 14,
+                   radius: Math.sqrt(fMass)*4, mass: fMass, color: a.color, mergeTimer: PHYSICS_TPS * 30
                 });
              }
              continue;
           }
 
-          if (a.mass > b.mass * 1.18) {
-            const isSibling = (a.ownerId === 'player' || a.id === 'player') && (b.ownerId === 'player' || b.id === 'player');
-            if (isSibling) {
-               if ((a.mergeTimer || 0) <= 0 && (b.mergeTimer || 0) <= 0) {
-                  a.mass += b.mass; deadSet.add(j);
-               }
+          if (a.mass > b.mass * 1.15) {
+            if (isPlayer && (b.ownerId === 'player' || b.id === 'player')) {
+               if (a.mergeTimer === 0 && b.mergeTimer === 0) { a.mass += b.mass; deadSet.add(j); }
             } else {
+              if (b.type === 'ejected' && b.ownerId === 'player' && isPlayer && now - (b.spawnTime || 0) < REABSORB_COOLDOWN) continue;
               a.mass += b.mass; deadSet.add(j);
-              if (a.id === 'player' || a.ownerId === 'player') xpGain += Math.floor(b.mass * 2.8);
+              if (isPlayer) xpGain += Math.floor(b.mass * 2.5);
             }
           }
         }
       }
     }
 
-    if (Date.now() % 1000 < 30) {
-      const scoreMap = entities
-        .filter(e => e.type === 'player' || e.type === 'ai')
-        .reduce((acc, curr) => {
-           const n = curr.ownerId === 'player' || curr.id === 'player' ? uiPlayer.name : (curr.class || 'BOT');
-           acc[n] = (acc[n] || 0) + curr.mass;
-           return acc;
-        }, {} as Record<string, number>);
-      
-      setLeaderboard(Object.entries(scoreMap)
-        .sort((a,b) => b[1] - a[1])
-        .slice(0, 8)
-        .map(([name, mass]) => ({ name, mass: Math.floor(mass) })));
+    if (now - lastLeaderboardUpdate.current > 250) {
+      lastLeaderboardUpdate.current = now;
+      const scores: Record<string, number> = {};
+      entities.forEach(e => {
+        if (e.type === 'player' || e.type === 'ai') {
+          const n = (e.ownerId === 'player' || e.id === 'player') ? uiPlayerRef.current.name : (e.class || 'BOT');
+          scores[n] = (scores[n] || 0) + e.mass;
+        }
+      });
+      setLeaderboard(Object.entries(scores).sort((a,b) => b[1] - a[1]).slice(0, 8).map(([name, mass]) => ({ name, mass: Math.floor(mass) })));
     }
 
-    if (xpGain > 0 || Math.floor(totalMassAccum) !== Math.floor(uiPlayer.mass)) {
+    if (xpGain > 0 || Math.floor(playerMassSum) !== Math.floor(uiPlayerRef.current.mass)) {
       setUiPlayer(prev => {
         let nExp = prev.exp + xpGain, nLvl = prev.level, nMax = prev.maxExp;
         while (nExp >= nMax) { nExp -= nMax; nLvl++; nMax = Math.floor(nMax * 1.5); }
-        return { ...prev, exp: nExp, level: nLvl, maxExp: nMax, mass: totalMassAccum };
+        return { ...prev, exp: nExp, level: nLvl, maxExp: nMax, mass: playerMassSum };
       });
     }
 
     if (deadSet.size > 0 || additions.length > 0) {
       const nextEnts = entities.filter((e, idx) => {
         if (deadSet.has(idx)) {
-          if (e.type === 'food') { e.x = Math.random() * MAP_SIZE; e.y = Math.random() * MAP_SIZE; return true; }
+          if (e.type === 'food') { 
+            e.x = Math.random() * MAP_SIZE; 
+            e.y = Math.random() * MAP_SIZE; 
+            return true; 
+          }
+          // Release to pool if it's a candidate
+          if (e.type === 'ejected') globalEntityPool.release(e);
           return false;
         }
         return true;
       });
       engineRef.current.entities = [...nextEnts, ...additions];
-      engineRef.current.playerIdx = engineRef.current.entities.findIndex(e => e.id === 'player' || e.ownerId === 'player');
-      if (engineRef.current.playerIdx === -1) setGameState('dead');
+      if (engineRef.current.entities.findIndex(e => e.id === 'player' || e.ownerId === 'player') === -1) setGameState('dead');
     }
-  }, [uiPlayer.mass, uiPlayer.name]);
+  }, [gameState]);
 
   useEffect(() => {
     if (gameState !== 'playing') return;
@@ -375,9 +389,7 @@ const App: React.FC = () => {
       lastTimeRef.current = time;
       let ticks = 0;
       while (accumulatorRef.current >= MS_PER_TICK && ticks < MAX_TICKS_PER_FRAME) {
-        runPhysicsTick();
-        accumulatorRef.current -= MS_PER_TICK;
-        ticks++;
+        runPhysicsTick(); accumulatorRef.current -= MS_PER_TICK; ticks++;
       }
       frameId = requestAnimationFrame(update);
     };
@@ -385,11 +397,38 @@ const App: React.FC = () => {
     return () => cancelAnimationFrame(frameId);
   }, [gameState, runPhysicsTick]);
 
+  const initWorld = (selectedClass: CellClass) => {
+    const ents: GameEntity[] = [];
+    ents.push({
+      id: 'player', type: 'player', x: MAP_SIZE / 2, y: MAP_SIZE / 2,
+      radius: Math.sqrt(INITIAL_MASS) * 4, color: CLASS_DATA[selectedClass].color,
+      mass: INITIAL_MASS, class: selectedClass, mergeTimer: 0
+    });
+    
+    // Use pool for food initialization
+    for (let i = 0; i < FOOD_COUNT; i++) {
+      const f = globalEntityPool.get('food');
+      f.id = `f-${i}`;
+      f.x = Math.random() * MAP_SIZE;
+      f.y = Math.random() * MAP_SIZE;
+      f.radius = 3;
+      f.color = '#475569';
+      f.mass = 1;
+      ents.push(f);
+    }
+
+    for (let i = 0; i < AI_COUNT; i++) {
+      const cls = Object.values(CellClass)[Math.floor(Math.random() * 5)] as CellClass;
+      ents.push({ id: `ai-${i}`, type: 'ai', x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, radius: 20, color: CLASS_DATA[cls].color, mass: 60 + Math.random() * 400, class: cls });
+    }
+    for (let i = 0; i < VIRUS_COUNT; i++) ents.push({ id: `v-${i}`, type: 'virus', x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, radius: 65, color: '#22c55e', mass: 100 });
+    engineRef.current = { entities: ents, playerIdx: 0 };
+    lastLeaderboardUpdate.current = 0;
+  };
+
   const startGame = (cls: CellClass) => {
     setUiPlayer(p => ({ ...p, name: playerName, class: cls, stats: CLASS_DATA[cls].baseStats, mass: INITIAL_MASS, level: 1, exp: 0, maxExp: 100 }));
-    initWorld(cls);
-    setGameState('playing');
-    lastTimeRef.current = 0;
+    initWorld(cls); setGameState('playing'); lastTimeRef.current = 0;
   };
 
   return (
@@ -398,29 +437,27 @@ const App: React.FC = () => {
         <>
           <GameCanvas player={uiPlayer} engineRef={engineRef as any} biomes={biomes} onMove={(x, y) => mouseRef.current = { x, y }} />
           
-          {/* Leaderboard Overlay */}
           <div className="absolute top-6 right-6 flex flex-col items-end gap-6 pointer-events-none">
-             <div className="glass p-6 rounded-[32px] w-64 border-white/10 shadow-[0_0_40px_rgba(0,0,0,0.5)] transition-all animate-in slide-in-from-right duration-500">
+             <div className="glass p-6 rounded-[32px] w-64 border-white/10 shadow-[0_0_40px_rgba(0,0,0,0.5)] transition-all">
                 <div className="flex items-center gap-2 mb-4 border-b border-white/10 pb-3">
                   <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
                   <h3 className="font-orbitron text-[10px] text-white/50 font-black tracking-[0.3em] uppercase">Apex Ranking</h3>
                 </div>
                 {leaderboard.map((entry, i) => (
-                  <div key={i} className={`flex justify-between items-center mb-2 last:mb-0 px-2 py-1 rounded-lg transition-colors ${entry.name === uiPlayer.name ? 'bg-indigo-500/20' : ''}`}>
+                  <div key={i} className={`flex justify-between items-center mb-2 last:mb-0 px-2 py-1 rounded-lg ${entry.name === uiPlayer.name ? 'bg-indigo-500/20' : ''}`}>
                     <span className={`text-[11px] font-bold truncate pr-3 ${entry.name === uiPlayer.name ? 'text-white' : 'text-white/30'}`}>{i+1}. {entry.name}</span>
                     <span className={`text-[10px] font-orbitron ${entry.name === uiPlayer.name ? 'text-indigo-300' : 'text-white/40'}`}>{entry.mass}</span>
                   </div>
                 ))}
              </div>
-             <div className="glass px-8 py-5 rounded-[32px] border-emerald-500/20 shadow-2xl animate-in slide-in-from-right duration-700">
+             <div className="glass px-8 py-5 rounded-[32px] border-emerald-500/20 shadow-2xl">
                 <div className="text-[10px] text-emerald-500/60 font-black uppercase tracking-[0.3em] mb-1 text-right">Biomass Units</div>
                 <div className="font-orbitron text-4xl text-emerald-400 font-black text-right tracking-tighter">{Math.floor(uiPlayer.mass)}</div>
              </div>
           </div>
 
-          {/* Player HUD */}
           <div className="absolute top-6 left-6 flex flex-col gap-6 pointer-events-none">
-            <div className="glass px-8 py-6 rounded-[32px] w-80 shadow-2xl border-white/10 animate-in slide-in-from-left duration-500">
+            <div className="glass px-8 py-6 rounded-[32px] w-80 shadow-2xl border-white/10">
               <div className="flex justify-between items-end mb-3">
                 <div className="flex flex-col">
                   <span className="text-[10px] text-white/30 font-black uppercase tracking-[0.3em]">Operator</span>
@@ -440,7 +477,7 @@ const App: React.FC = () => {
               <div className={`w-3 h-3 rounded-full shadow-[0_0_10px_currentColor] ${isThinking ? 'text-amber-500 bg-amber-500 animate-pulse' : 'text-emerald-500 bg-emerald-500'}`} />
               <div className="flex flex-col items-start">
                 <span className="text-[9px] font-orbitron font-black text-white/40 uppercase tracking-[0.3em]">Tactical Core</span>
-                <span className="text-[11px] font-orbitron text-white group-hover:text-indigo-400 transition-colors uppercase font-bold">{isThinking ? 'Analyzing Arena...' : 'Neural Advisory'}</span>
+                <span className="text-[11px] font-orbitron text-white group-hover:text-indigo-400 uppercase font-bold">{isThinking ? 'Thinking Deeply...' : 'Neural Advisory'}</span>
               </div>
             </button>
 
@@ -452,19 +489,21 @@ const App: React.FC = () => {
             )}
           </div>
 
-          {/* Controls Hint */}
-          <div className="absolute bottom-10 left-10 flex gap-6 pointer-events-none opacity-40 hover:opacity-100 transition-opacity">
-             <div className="flex items-center gap-3">
-               <div className="glass w-10 h-10 rounded-xl flex items-center justify-center font-orbitron font-black border-white/20">W</div>
-               <span className="text-[10px] font-orbitron tracking-widest uppercase">Eject</span>
-             </div>
-             <div className="flex items-center gap-3">
-               <div className="glass px-4 h-10 rounded-xl flex items-center justify-center font-orbitron font-black border-white/20">SPACE</div>
-               <span className="text-[10px] font-orbitron tracking-widest uppercase">Split</span>
+          <div className="absolute bottom-10 left-10 flex flex-col gap-4 pointer-events-auto">
+             <ChatBot />
+             <div className="flex gap-4 pointer-events-none opacity-40 hover:opacity-100 transition-opacity">
+               <div className="flex items-center gap-3">
+                 <div className="glass w-10 h-10 rounded-xl flex items-center justify-center font-orbitron font-black border-white/20">W</div>
+                 <span className="text-[10px] font-orbitron tracking-widest uppercase text-white">Eject</span>
+               </div>
+               <div className="flex items-center gap-3">
+                 <div className="glass px-4 h-10 rounded-xl flex items-center justify-center font-orbitron font-black border-white/20">SPACE</div>
+                 <span className="text-[10px] font-orbitron tracking-widest uppercase text-white">Split</span>
+               </div>
              </div>
           </div>
 
-          <div className="absolute bottom-10 right-10 animate-in zoom-in duration-1000">
+          <div className="absolute bottom-10 right-10">
             <Minimap player={uiPlayer} entities={engineRef.current.entities} biomes={biomes} />
           </div>
         </>
@@ -476,7 +515,6 @@ const App: React.FC = () => {
           </div>
 
           <div className="relative mb-16 group">
-            <div className="absolute inset-0 bg-indigo-500/20 blur-[50px] opacity-0 group-focus-within:opacity-100 transition-opacity" />
             <input 
               className="relative bg-slate-900/60 p-8 rounded-[40px] text-center font-orbitron text-2xl w-[450px] outline-none text-white border border-white/10 focus:border-indigo-500/50 focus:bg-slate-900/80 transition-all shadow-2xl placeholder:text-white/10 tracking-[0.2em] font-black" 
               placeholder="IDENTIFY" 
@@ -489,40 +527,18 @@ const App: React.FC = () => {
           <div className="grid grid-cols-2 md:grid-cols-5 gap-8 max-w-7xl">
             {(Object.keys(CLASS_DATA) as CellClass[]).map(cls => (
               <div key={cls} className="relative group">
-                {/* Stats Tooltip */}
-                <div className={`absolute -top-32 left-1/2 -translate-x-1/2 w-48 glass p-4 rounded-2xl opacity-0 group-hover:opacity-100 transition-all duration-300 pointer-events-none z-50 border-indigo-500/20 shadow-2xl ${selectedHoverClass === cls ? 'translate-y-0' : 'translate-y-4'}`}>
-                  <div className="flex flex-col gap-2">
-                    <div className="flex justify-between items-center text-[10px] font-orbitron">
-                      <span className="text-white/40">SPEED</span>
-                      <span className="text-white font-black">{CLASS_DATA[cls].baseStats.speed.toFixed(1)}</span>
-                    </div>
-                    <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
-                      <div className="h-full bg-white/40" style={{ width: `${CLASS_DATA[cls].baseStats.speed * 40}%` }} />
-                    </div>
-                    <div className="flex justify-between items-center text-[10px] font-orbitron mt-1">
-                      <span className="text-white/40">DEFENSE</span>
-                      <span className="text-white font-black">{CLASS_DATA[cls].baseStats.defense.toFixed(1)}</span>
-                    </div>
-                    <div className="w-full h-1 bg-white/5 rounded-full overflow-hidden">
-                      <div className="h-full bg-indigo-400" style={{ width: `${CLASS_DATA[cls].baseStats.defense * 40}%` }} />
-                    </div>
-                  </div>
-                </div>
-
                 <button 
                   onClick={() => startGame(cls)} 
                   onMouseEnter={() => setSelectedHoverClass(cls)}
                   onMouseLeave={() => setSelectedHoverClass(null)}
                   className="glass p-10 rounded-[48px] hover:bg-white/10 transition-all group border-transparent hover:border-white/20 shadow-2xl flex flex-col items-center w-full relative overflow-hidden"
                 >
-                  <div className="absolute inset-0 opacity-0 group-hover:opacity-10 transition-opacity bg-gradient-to-b from-transparent to-white/20" />
-                  <div 
-                    className="w-16 h-16 rounded-full mb-8 group-hover:scale-125 transition-transform duration-500 shadow-[0_0_30px_rgba(0,0,0,0.5)] relative" 
+                  <div className="w-16 h-16 rounded-full mb-8 group-hover:scale-125 transition-transform duration-500 shadow-[0_0_30px_rgba(0,0,0,0.5)] relative" 
                     style={{ background: CLASS_DATA[cls].color }}
                   >
                     <div className="absolute inset-0 rounded-full bg-inherit blur-md opacity-40 group-hover:opacity-80 transition-opacity" />
                   </div>
-                  <span className="text-[12px] font-orbitron font-black text-white tracking-[0.4em] uppercase group-hover:text-indigo-400 group-hover:scale-110 transition-all">{cls}</span>
+                  <span className="text-[12px] font-orbitron font-black text-white tracking-[0.4em] uppercase group-hover:text-indigo-400 transition-all">{cls}</span>
                 </button>
               </div>
             ))}
@@ -531,15 +547,14 @@ const App: React.FC = () => {
       ) : (
         <div className="flex flex-col items-center justify-center h-full text-center animate-in zoom-in duration-700 p-8">
           <div className="mb-12 relative">
-            <div className="absolute inset-0 blur-[120px] bg-red-600/30 opacity-60" />
             <h2 className="relative font-orbitron text-9xl font-black text-red-600 italic tracking-tighter drop-shadow-2xl">CONSUMED</h2>
             <p className="font-orbitron text-white/30 tracking-[1em] uppercase mt-2 font-black">Biological Failure</p>
           </div>
           <button 
             onClick={() => setGameState('menu')} 
-            className="glass px-20 py-8 rounded-[48px] font-orbitron font-black text-white hover:bg-white/10 tracking-[0.5em] transition-all text-2xl hover:scale-105 border-white/20 shadow-2xl group"
+            className="glass px-20 py-8 rounded-[48px] font-orbitron font-black text-white hover:bg-white/10 tracking-[0.5em] transition-all text-2xl hover:scale-105 border-white/20 shadow-2xl"
           >
-            <span className="group-hover:text-red-400 transition-colors">RE-EVOLVE</span>
+            RE-EVOLVE
           </button>
         </div>
       )}
