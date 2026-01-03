@@ -64,11 +64,24 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({ player, engineRef, biome
     const pEnt = entities[engine.playerIdx];
     if (!pEnt) return;
 
-    // Smooth Camera Follow
-    cam.current.x += (pEnt.x - cam.current.x) * 0.15;
-    cam.current.y += (pEnt.y - cam.current.y) * 0.15;
-    const targetZoom = Math.max(0.2, Math.min(1.0, 100 / (Math.sqrt(pEnt.mass) + 50)));
-    cam.current.zoom += (targetZoom - cam.current.zoom) * 0.05;
+    // Adjusted Camera Follow Smoothing (from 0.15 to 0.25 for snappier tracking)
+    cam.current.x += (pEnt.x - cam.current.x) * 0.25;
+    cam.current.y += (pEnt.y - cam.current.y) * 0.25;
+
+    // Dynamic Zoom calculation based on player mass AND nearby entity density
+    // We check how many entities are in the immediate vicinity to decide if we should zoom out more
+    const nearbyCount = entities.filter(e => 
+      e.id !== 'player' && 
+      Math.abs(e.x - pEnt.x) < 1000 && 
+      Math.abs(e.y - pEnt.y) < 1000
+    ).length;
+
+    // Density factor: zooms out slightly as areas become more crowded
+    const densityZoomFactor = Math.max(0, (nearbyCount - 5) * 0.005);
+    const massZoomFactor = 100 / (Math.sqrt(pEnt.mass) + 50);
+    
+    const targetZoom = Math.max(0.15, Math.min(1.0, massZoomFactor - densityZoomFactor));
+    cam.current.zoom += (targetZoom - cam.current.zoom) * 0.08;
 
     const { width, height } = canvas;
     const zoom = cam.current.zoom;
@@ -90,7 +103,6 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({ player, engineRef, biome
 
     // Draw Biomes (Culled)
     biomes.forEach(b => {
-      // Basic rect intersection for culling
       if (!(b.bounds.x + b.bounds.w < vX || b.bounds.x > vX + vW || b.bounds.y + b.bounds.h < vY || b.bounds.y > vY + vH)) {
         ctx.fillStyle = b.color + '0a';
         ctx.fillRect(b.bounds.x, b.bounds.y, b.bounds.w, b.bounds.h);
@@ -123,28 +135,24 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({ player, engineRef, biome
     for (let i = 0; i < entities.length; i++) {
       const e = entities[i];
       if (e.type !== 'food') continue;
-      // Cull check
       if (e.x < vX || e.x > vX + vW || e.y < vY || e.y > vY + vH) continue;
       ctx.moveTo(e.x + 3, e.y);
       ctx.arc(e.x, e.y, 3, 0, Math.PI * 2);
     }
     ctx.fill();
 
-    // Render Actors (Players & AI)
+    // Render Actors
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     
     for (let i = 0; i < entities.length; i++) {
       const e = entities[i];
       if (e.type === 'food') continue;
-      
-      // Frustum Culling for Actors
       if (e.x + e.radius < vX || e.x - e.radius > vX + vW || e.y + e.radius < vY || e.y - e.radius > vY + vH) continue;
 
       const texture = getCellTexture(e.color, e.radius);
       ctx.drawImage(texture, e.x - texture.width / 2, e.y - texture.height / 2);
 
-      // Labeling (Only if large enough on screen)
       if (e.radius * zoom > 12) {
         ctx.fillStyle = 'rgba(255,255,255,0.9)';
         const fontSize = Math.max(12, Math.floor(e.radius * 0.35));
@@ -152,7 +160,6 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({ player, engineRef, biome
         const label = e.id === 'player' ? player.name : (e.class || 'BIOMASS');
         ctx.fillText(label, e.x, e.y);
         
-        // Level badge for large entities
         if (e.radius * zoom > 30) {
           ctx.font = `bold ${fontSize * 0.5}px Orbitron`;
           ctx.fillStyle = 'rgba(255,255,255,0.5)';
