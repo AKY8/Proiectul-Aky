@@ -4,9 +4,11 @@ import { GameCanvas } from './components/GameCanvas';
 import { Minimap } from './components/Minimap';
 import { PlayerState, CellClass, GameEntity, Biome } from './types';
 import { INITIAL_MASS, CLASS_DATA, MAP_SIZE, FOOD_COUNT, AI_COUNT } from './constants';
+import { GoogleGenAI } from "@google/genai";
 
 const PHYSICS_TPS = 60;
 const MS_PER_TICK = 1000 / PHYSICS_TPS;
+const MAX_TICKS_PER_FRAME = 5; // Prevents "Spiral of Death"
 const GRID_SIZE = 400;
 
 class GameEngine {
@@ -16,10 +18,11 @@ class GameEngine {
 
   updateGrid() {
     this.grid.clear();
-    for (let i = 0; i < this.entities.length; i++) {
+    const len = this.entities.length;
+    for (let i = 0; i < len; i++) {
       const e = this.entities[i];
-      const gx = Math.floor(e.x / GRID_SIZE);
-      const gy = Math.floor(e.y / GRID_SIZE);
+      const gx = (e.x / GRID_SIZE) | 0;
+      const gy = (e.y / GRID_SIZE) | 0;
       const key = `${gx},${gy}`;
       let cell = this.grid.get(key);
       if (!cell) {
@@ -32,14 +35,16 @@ class GameEngine {
 
   getNearbyIndices(x: number, y: number, radius: number): number[] {
     const indices: number[] = [];
-    const gx = Math.floor(x / GRID_SIZE);
-    const gy = Math.floor(y / GRID_SIZE);
+    const gx = (x / GRID_SIZE) | 0;
+    const gy = (y / GRID_SIZE) | 0;
     const range = Math.ceil((radius * 2) / GRID_SIZE) + 1;
+    
     for (let ox = -range; ox <= range; ox++) {
       for (let oy = -range; oy <= range; oy++) {
         const cell = this.grid.get(`${gx + ox},${gy + oy}`);
         if (cell) {
-          for (let k = 0; k < cell.length; k++) indices.push(cell[k]);
+          const cLen = cell.length;
+          for (let k = 0; k < cLen; k++) indices.push(cell[k]);
         }
       }
     }
@@ -50,11 +55,14 @@ class GameEngine {
 const App: React.FC = () => {
   const [gameState, setGameState] = useState<'menu' | 'playing' | 'dead'>('menu');
   const [playerName, setPlayerName] = useState(() => localStorage.getItem('osmos_name') || 'SUBJECT-01');
+  const [isThinking, setIsThinking] = useState(false);
+  const [advisorMessage, setAdvisorMessage] = useState<string | null>(null);
   
   const engineRef = useRef(new GameEngine());
   const mouseRef = useRef({ x: 0, y: 0 });
   const lastTimeRef = useRef<number>(0);
   const accumulatorRef = useRef<number>(0);
+  const tickCounterRef = useRef<number>(0);
   
   const [uiPlayer, setUiPlayer] = useState<PlayerState>({
     id: 'player', name: playerName, level: 1, exp: 0, maxExp: 100,
@@ -67,6 +75,40 @@ const App: React.FC = () => {
     { id: '2', name: 'Magma Core', color: '#ef4444', bounds: { x: 5000, y: 5000, w: 2500, h: 2500 }, effect: 'lava' },
     { id: '3', name: 'Energy Nexus', color: '#0ea5e9', bounds: { x: 4000, y: 1000, w: 2000, h: 3000 }, effect: 'nutrient' },
   ], []);
+
+  const requestAdvice = async () => {
+    if (isThinking) return;
+    setIsThinking(true);
+    setAdvisorMessage("Initiating Neural Link with Gemini 3 Pro...");
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const prompt = `System: Strategic Evolutionary Analysis.
+      Player Context:
+      - Name: ${uiPlayer.name}
+      - Bio-Class: ${uiPlayer.class}
+      - Level: ${uiPlayer.level}
+      - Mass: ${Math.floor(uiPlayer.mass)}
+      - Threat Density: High
+      
+      Instructions: Use your deep reasoning to provide a tactical survival strategy for a ${uiPlayer.class} in a hostile 2D arena. Focus on biome utilization and mass preservation. Keep it under 40 words, cyberpunk tone.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-pro-preview',
+        contents: prompt,
+        config: {
+          thinkingConfig: { thinkingBudget: 32768 }
+        },
+      });
+
+      setAdvisorMessage(response.text || "Evolutionary vectors undefined.");
+    } catch (err) {
+      setAdvisorMessage("Neural connection desynced. Rely on instincts.");
+    } finally {
+      setIsThinking(false);
+      setTimeout(() => setAdvisorMessage(null), 10000);
+    }
+  };
 
   const initWorld = (selectedClass: CellClass) => {
     const ents: GameEntity[] = [];
@@ -98,10 +140,13 @@ const App: React.FC = () => {
     const entities = eng.entities;
     if (eng.playerIdx === -1) return;
     const pEnt = entities[eng.playerIdx];
+    
+    tickCounterRef.current++;
 
     for (let i = 0; i < entities.length; i++) {
       const e = entities[i];
       if (e.type === 'food') continue;
+
       const stats = e.class ? CLASS_DATA[e.class].baseStats : { speed: 1 };
       const speedBase = (stats.speed * 8.5) / (1 + Math.sqrt(e.mass) / 12);
 
@@ -112,19 +157,23 @@ const App: React.FC = () => {
           e.x += (dx / d) * speedBase;
           e.y += (dy / d) * speedBase;
         }
-        e.mass *= 0.9998;
+        e.mass *= 0.99985; // Slightly buffed retention
       } else {
         const distToPlayer = Math.hypot(pEnt.x - e.x, pEnt.y - e.y);
-        if (distToPlayer < 1800) {
-          const factor = e.mass > pEnt.mass * 1.15 ? 0.6 : -0.85;
-          e.x += ((pEnt.x - e.x) / distToPlayer) * speedBase * factor;
-          e.y += ((pEnt.y - e.y) / distToPlayer) * speedBase * factor;
-        } else {
-          e.x += (Math.random() - 0.5) * 3;
-          e.y += (Math.random() - 0.5) * 3;
+        let shouldUpdate = false;
+        if (distToPlayer < 1500) shouldUpdate = true;
+        else if (distToPlayer < 3000) shouldUpdate = tickCounterRef.current % 4 === 0;
+        else if (distToPlayer < 5000) shouldUpdate = tickCounterRef.current % 12 === 0;
+
+        if (shouldUpdate) {
+          const factor = e.mass > pEnt.mass * 1.15 ? 0.65 : -0.9;
+          const angle = Math.atan2(pEnt.y - e.y, pEnt.x - e.x);
+          e.x += Math.cos(angle) * speedBase * factor;
+          e.y += Math.sin(angle) * speedBase * factor;
+          e.mass *= 0.99975;
         }
-        e.mass *= 0.9997;
       }
+      
       e.x = Math.max(0, Math.min(MAP_SIZE, e.x));
       e.y = Math.max(0, Math.min(MAP_SIZE, e.y));
       e.radius = Math.sqrt(e.mass) * 4;
@@ -137,13 +186,16 @@ const App: React.FC = () => {
     for (let i = 0; i < entities.length; i++) {
       const a = entities[i];
       if (deadSet.has(i) || a.type === 'food') continue;
+      
       const nearby = eng.getNearbyIndices(a.x, a.y, a.radius);
       for (let k = 0; k < nearby.length; k++) {
         const j = nearby[k];
         if (i === j || deadSet.has(j)) continue;
         const b = entities[j];
         const distSq = (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
-        if (distSq < (a.radius * 0.95) ** 2 && a.mass > b.mass * 1.15) {
+        const threshold = (a.radius * 0.95) ** 2;
+        
+        if (distSq < threshold && a.mass > b.mass * 1.15) {
           a.mass += b.mass * (a.id === 'player' ? uiPlayer.stats.absorption : 1);
           deadSet.add(j);
           if (a.id === 'player') xpGain += Math.floor(b.mass * 5);
@@ -163,7 +215,9 @@ const App: React.FC = () => {
       const nextEnts: GameEntity[] = [];
       for (let i = 0; i < entities.length; i++) {
         if (!deadSet.has(i)) nextEnts.push(entities[i]);
-        else if (entities[i].type === 'food') nextEnts.push({ ...entities[i], x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE });
+        else if (entities[i].type === 'food') {
+           nextEnts.push({ ...entities[i], x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE });
+        }
       }
       eng.entities = nextEnts;
       eng.playerIdx = eng.entities.findIndex(e => e.id === 'player');
@@ -176,12 +230,19 @@ const App: React.FC = () => {
     let frameId: number;
     const loop = (time: number) => {
       if (!lastTimeRef.current) lastTimeRef.current = time;
-      accumulatorRef.current += time - lastTimeRef.current;
+      const deltaTime = time - lastTimeRef.current;
       lastTimeRef.current = time;
-      while (accumulatorRef.current >= MS_PER_TICK) {
+      
+      accumulatorRef.current += deltaTime;
+      let ticks = 0;
+      while (accumulatorRef.current >= MS_PER_TICK && ticks < MAX_TICKS_PER_FRAME) {
         runPhysicsTick();
         accumulatorRef.current -= MS_PER_TICK;
+        ticks++;
       }
+      // If we skipped too many ticks, drain the accumulator to prevent stutters
+      if (accumulatorRef.current > MS_PER_TICK) accumulatorRef.current = 0;
+      
       frameId = requestAnimationFrame(loop);
     };
     frameId = requestAnimationFrame(loop);
@@ -203,7 +264,6 @@ const App: React.FC = () => {
         <>
           <GameCanvas player={uiPlayer} engineRef={engineRef} biomes={biomes} onMove={(x, y) => mouseRef.current = { x, y }} />
           
-          {/* Enhanced HUD */}
           <div className="absolute top-8 left-8 flex flex-col gap-5 pointer-events-none">
             <div className="glass px-6 py-5 rounded-[2rem] w-80 shadow-2xl border-white/5 bg-slate-900/60 backdrop-blur-xl">
               <div className="flex justify-between items-start mb-4">
@@ -222,20 +282,37 @@ const App: React.FC = () => {
               <div className="relative w-full h-2 bg-white/5 rounded-full overflow-hidden border border-white/5">
                 <div className="h-full bg-gradient-to-r from-indigo-600 to-blue-400 transition-all duration-500 shadow-[0_0_10px_rgba(79,70,229,0.5)]" style={{ width: `${(uiPlayer.exp / uiPlayer.maxExp) * 100}%` }} />
               </div>
-              <div className="flex justify-between mt-2 text-[9px] font-bold text-slate-500 uppercase tracking-widest">
-                <span>Core Progression</span>
-                <span>{Math.floor((uiPlayer.exp / uiPlayer.maxExp) * 100)}%</span>
-              </div>
             </div>
+
+            <div className="pointer-events-auto">
+               <button 
+                onClick={requestAdvice}
+                disabled={isThinking}
+                className={`glass px-6 py-4 rounded-2xl flex items-center gap-3 transition-all hover:scale-105 active:scale-95 border-indigo-500/30 shadow-indigo-500/10 shadow-lg ${isThinking ? 'opacity-50' : ''}`}
+               >
+                 <div className={`w-3 h-3 rounded-full bg-indigo-500 ${isThinking ? 'animate-pulse' : ''}`}></div>
+                 <span className="font-orbitron text-[10px] font-black text-white uppercase tracking-widest">
+                   {isThinking ? 'Thinking...' : 'Gemini Advisor'}
+                 </span>
+               </button>
+            </div>
+
+            {advisorMessage && (
+              <div className="glass p-5 rounded-2xl w-80 bg-indigo-950/40 border-indigo-400/20 animate-in fade-in slide-in-from-left-4 duration-500 shadow-2xl">
+                <p className="text-[11px] text-indigo-100 font-medium leading-relaxed">
+                  <span className="text-indigo-400 font-black mr-2">CORE_LOGIC:</span>
+                  {advisorMessage}
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="absolute top-8 right-8 flex flex-col items-end gap-3 pointer-events-none">
-            <div className="glass px-8 py-5 rounded-[2.5rem] bg-slate-900/40 backdrop-blur-md border-emerald-500/20 shadow-xl shadow-emerald-900/10">
+            <div className="glass px-8 py-5 rounded-[2.5rem] bg-slate-900/40 backdrop-blur-md border-emerald-500/20 shadow-2xl">
                <div className="flex flex-col items-end">
                   <span className="text-[10px] text-emerald-500/60 font-black uppercase tracking-[0.3em] mb-1">Total Biomass</span>
                   <div className="flex items-baseline gap-2">
-                    <span className="font-orbitron text-4xl text-emerald-400 font-black leading-none tabular-nums drop-shadow-[0_0_8px_rgba(52,211,153,0.3)]">{Math.floor(uiPlayer.mass)}</span>
-                    <span className="text-xs font-black text-emerald-600/80">µg</span>
+                    <span className="font-orbitron text-4xl text-emerald-400 font-black leading-none tabular-nums">{Math.floor(uiPlayer.mass)}</span>
                   </div>
                </div>
             </div>
@@ -247,18 +324,15 @@ const App: React.FC = () => {
         </>
       ) : gameState === 'menu' ? (
         <div className="flex flex-col items-center justify-center h-full p-8 relative overflow-hidden">
-          {/* Animated Background Orbs */}
           <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-600/10 blur-[120px] rounded-full animate-pulse"></div>
-          <div className="absolute bottom-[-5%] right-[-5%] w-[30%] h-[30%] bg-emerald-600/10 blur-[100px] rounded-full animate-pulse" style={{ animationDelay: '1s' }}></div>
-
           <div className="z-10 text-center max-w-5xl w-full">
             <h1 className="font-orbitron text-[120px] font-black italic text-white mb-2 tracking-tighter leading-none drop-shadow-2xl">OSMOS</h1>
             <p className="text-indigo-400 font-orbitron text-sm tracking-[1.5em] uppercase mb-16 opacity-60">Prime Evolutionary Interface</p>
             
             <div className="flex flex-col items-center gap-12">
-              <div className="glass p-2 rounded-3xl group transition-all hover:border-white/20 focus-within:border-indigo-500/50">
+              <div className="glass p-2 rounded-3xl group shadow-2xl">
                 <input 
-                  className="bg-slate-900/40 p-6 rounded-2xl text-center font-orbitron text-2xl w-[400px] outline-none text-white focus:bg-slate-800/60 transition-all uppercase tracking-widest placeholder:text-slate-700" 
+                  className="bg-slate-900/40 p-6 rounded-2xl text-center font-orbitron text-2xl w-[400px] outline-none text-white focus:bg-slate-800/60 transition-all uppercase tracking-widest placeholder:text-white/10" 
                   placeholder="IDENTIFY SUBJECT"
                   value={playerName} 
                   onChange={e => setPlayerName(e.target.value.toUpperCase().slice(0, 15))} 
@@ -267,30 +341,12 @@ const App: React.FC = () => {
 
               <div className="grid grid-cols-1 md:grid-cols-5 gap-4 w-full">
                 {(Object.keys(CLASS_DATA) as CellClass[]).map(cls => (
-                  <button 
-                    key={cls} 
-                    onClick={() => startGame(cls)} 
-                    className="group relative flex flex-col items-center p-8 rounded-[3rem] glass border-white/5 hover:bg-white/5 transition-all duration-500 hover:-translate-y-2 hover:shadow-2xl active:scale-95 overflow-hidden"
-                  >
-                    <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/20 opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                    <div 
-                      className="w-16 h-16 rounded-full mb-6 shadow-2xl group-hover:scale-125 transition-transform duration-500 relative z-10" 
-                      style={{ 
-                        background: CLASS_DATA[cls].color,
-                        boxShadow: `0 0 30px ${CLASS_DATA[cls].color}44`
-                      }}
-                    >
-                      <div className="absolute inset-0 rounded-full bg-white/20 blur-sm scale-75 animate-pulse"></div>
-                    </div>
-                    <h3 className="font-orbitron text-xs font-black text-white tracking-widest uppercase mb-3 z-10">{cls}</h3>
-                    <p className="text-[10px] text-slate-400 font-semibold leading-relaxed h-12 opacity-0 group-hover:opacity-100 transition-opacity duration-300 px-2 z-10">
+                  <button key={cls} onClick={() => startGame(cls)} className="group relative flex flex-col items-center p-8 rounded-[3rem] glass border-white/5 hover:bg-white/5 transition-all hover:-translate-y-2 overflow-hidden shadow-xl">
+                    <div className="w-16 h-16 rounded-full mb-6 shadow-2xl group-hover:scale-125 transition-transform" style={{ background: CLASS_DATA[cls].color }}></div>
+                    <h3 className="font-orbitron text-xs font-black text-white tracking-widest uppercase mb-3">{cls}</h3>
+                    <p className="text-[10px] text-slate-400 font-semibold leading-relaxed h-12 opacity-0 group-hover:opacity-100 transition-opacity">
                       {CLASS_DATA[cls].description}
                     </p>
-                    <div className="mt-4 flex gap-1 opacity-40 group-hover:opacity-100 transition-opacity">
-                       <div className="w-1 h-1 rounded-full bg-white"></div>
-                       <div className="w-1 h-1 rounded-full bg-white"></div>
-                       <div className="w-1 h-1 rounded-full bg-white"></div>
-                    </div>
                   </button>
                 ))}
               </div>
@@ -299,16 +355,9 @@ const App: React.FC = () => {
         </div>
       ) : (
         <div className="flex items-center justify-center h-full bg-slate-950/90 backdrop-blur-3xl">
-          <div className="text-center glass p-20 rounded-[4rem] max-w-lg w-full border-red-500/20 shadow-[0_0_100px_rgba(239,68,68,0.1)]">
+          <div className="text-center glass p-20 rounded-[4rem] max-w-lg w-full border-red-500/20 shadow-red-500/10 shadow-2xl">
             <h2 className="font-orbitron text-6xl font-black text-red-500 mb-4 italic tracking-tighter">FAILURE</h2>
-            <p className="font-orbitron text-[10px] tracking-[0.5em] text-red-500/50 uppercase mb-12">Genetic structural integrity compromised</p>
-            <button 
-              onClick={() => { setGameState('menu'); lastTimeRef.current = 0; }} 
-              className="group relative w-full overflow-hidden bg-red-600/10 border border-red-500/30 py-6 rounded-3xl font-orbitron font-black text-red-500 hover:bg-red-500 hover:text-white transition-all duration-300 shadow-xl"
-            >
-              <span className="relative z-10">RE-EVOLVE</span>
-              <div className="absolute inset-0 bg-red-500 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
-            </button>
+            <button onClick={() => { setGameState('menu'); lastTimeRef.current = 0; }} className="w-full bg-red-600/10 border border-red-500/30 py-6 rounded-3xl font-orbitron font-black text-red-500 hover:bg-red-500 hover:text-white transition-all">RE-EVOLVE</button>
           </div>
         </div>
       )}
