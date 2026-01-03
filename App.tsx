@@ -8,7 +8,7 @@ import { GoogleGenAI } from "@google/genai";
 
 const PHYSICS_TPS = 60;
 const MS_PER_TICK = 1000 / PHYSICS_TPS;
-const MAX_TICKS_PER_FRAME = 5; // Prevents "Spiral of Death"
+const MAX_TICKS_PER_FRAME = 5; 
 const GRID_SIZE = 400;
 
 class GameEngine {
@@ -37,7 +37,8 @@ class GameEngine {
     const indices: number[] = [];
     const gx = (x / GRID_SIZE) | 0;
     const gy = (y / GRID_SIZE) | 0;
-    const range = Math.ceil((radius * 2) / GRID_SIZE) + 1;
+    // We add +1 to the range to ensure we catch entities bleeding over from adjacent cells
+    const range = Math.ceil((radius + GRID_SIZE) / GRID_SIZE);
     
     for (let ox = -range; ox <= range; ox++) {
       for (let oy = -range; oy <= range; oy++) {
@@ -91,7 +92,7 @@ const App: React.FC = () => {
       - Mass: ${Math.floor(uiPlayer.mass)}
       - Threat Density: High
       
-      Instructions: Use your deep reasoning to provide a tactical survival strategy for a ${uiPlayer.class} in a hostile 2D arena. Focus on biome utilization and mass preservation. Keep it under 40 words, cyberpunk tone.`;
+      Instructions: Provide a tactical survival strategy for a ${uiPlayer.class} in a hostile 2D arena. focus on behavior. Under 35 words.`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-3-pro-preview',
@@ -103,7 +104,7 @@ const App: React.FC = () => {
 
       setAdvisorMessage(response.text || "Evolutionary vectors undefined.");
     } catch (err) {
-      setAdvisorMessage("Neural connection desynced. Rely on instincts.");
+      setAdvisorMessage("Neural connection desynced.");
     } finally {
       setIsThinking(false);
       setTimeout(() => setAdvisorMessage(null), 10000);
@@ -143,6 +144,7 @@ const App: React.FC = () => {
     
     tickCounterRef.current++;
 
+    // 1. Movement and Mass Decay
     for (let i = 0; i < entities.length; i++) {
       const e = entities[i];
       if (e.type === 'food') continue;
@@ -157,7 +159,7 @@ const App: React.FC = () => {
           e.x += (dx / d) * speedBase;
           e.y += (dy / d) * speedBase;
         }
-        e.mass *= 0.99985; // Slightly buffed retention
+        e.mass *= 0.99985;
       } else {
         const distToPlayer = Math.hypot(pEnt.x - e.x, pEnt.y - e.y);
         let shouldUpdate = false;
@@ -179,30 +181,39 @@ const App: React.FC = () => {
       e.radius = Math.sqrt(e.mass) * 4;
     }
 
+    // 2. Spatial Update
     eng.updateGrid();
     const deadSet = new Set<number>();
     let xpGain = 0;
 
+    // 3. Optimized Collision via Spatial Grid
     for (let i = 0; i < entities.length; i++) {
       const a = entities[i];
       if (deadSet.has(i) || a.type === 'food') continue;
       
+      // Get only entities in same/neighboring cells
       const nearby = eng.getNearbyIndices(a.x, a.y, a.radius);
+      
       for (let k = 0; k < nearby.length; k++) {
         const j = nearby[k];
         if (i === j || deadSet.has(j)) continue;
+        
         const b = entities[j];
         const distSq = (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
         const threshold = (a.radius * 0.95) ** 2;
         
-        if (distSq < threshold && a.mass > b.mass * 1.15) {
-          a.mass += b.mass * (a.id === 'player' ? uiPlayer.stats.absorption : 1);
-          deadSet.add(j);
-          if (a.id === 'player') xpGain += Math.floor(b.mass * 5);
+        if (distSq < threshold) {
+          // Rule: Larger cell eats smaller cell if it has at least 15% more mass
+          if (a.mass > b.mass * 1.15) {
+            a.mass += b.mass * (a.id === 'player' ? uiPlayer.stats.absorption : 1);
+            deadSet.add(j);
+            if (a.id === 'player') xpGain += Math.floor(b.mass * 5);
+          }
         }
       }
     }
 
+    // 4. State Synchronization
     if (xpGain > 0 || Math.floor(pEnt.mass) !== Math.floor(uiPlayer.mass)) {
       setUiPlayer(prev => {
         let nExp = prev.exp + xpGain, nLvl = prev.level, nMax = prev.maxExp;
@@ -211,6 +222,7 @@ const App: React.FC = () => {
       });
     }
 
+    // 5. Cleanup
     if (deadSet.size > 0) {
       const nextEnts: GameEntity[] = [];
       for (let i = 0; i < entities.length; i++) {
@@ -240,9 +252,7 @@ const App: React.FC = () => {
         accumulatorRef.current -= MS_PER_TICK;
         ticks++;
       }
-      // If we skipped too many ticks, drain the accumulator to prevent stutters
       if (accumulatorRef.current > MS_PER_TICK) accumulatorRef.current = 0;
-      
       frameId = requestAnimationFrame(loop);
     };
     frameId = requestAnimationFrame(loop);
@@ -300,7 +310,7 @@ const App: React.FC = () => {
             {advisorMessage && (
               <div className="glass p-5 rounded-2xl w-80 bg-indigo-950/40 border-indigo-400/20 animate-in fade-in slide-in-from-left-4 duration-500 shadow-2xl">
                 <p className="text-[11px] text-indigo-100 font-medium leading-relaxed">
-                  <span className="text-indigo-400 font-black mr-2">CORE_LOGIC:</span>
+                  <span className="text-indigo-400 font-black mr-2">ANALYSIS:</span>
                   {advisorMessage}
                 </p>
               </div>
@@ -310,7 +320,7 @@ const App: React.FC = () => {
           <div className="absolute top-8 right-8 flex flex-col items-end gap-3 pointer-events-none">
             <div className="glass px-8 py-5 rounded-[2.5rem] bg-slate-900/40 backdrop-blur-md border-emerald-500/20 shadow-2xl">
                <div className="flex flex-col items-end">
-                  <span className="text-[10px] text-emerald-500/60 font-black uppercase tracking-[0.3em] mb-1">Total Biomass</span>
+                  <span className="text-[10px] text-emerald-500/60 font-black uppercase tracking-[0.3em] mb-1">Mass</span>
                   <div className="flex items-baseline gap-2">
                     <span className="font-orbitron text-4xl text-emerald-400 font-black leading-none tabular-nums">{Math.floor(uiPlayer.mass)}</span>
                   </div>
