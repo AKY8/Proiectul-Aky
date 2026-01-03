@@ -32,7 +32,9 @@ export type AIBehavior = 'flee' | 'hunt' | 'idle' | 'ambush' | 'team';
 
 export interface GameEntity {
   id: string;
-  type: 'player' | 'ai' | 'food' | 'hazard';
+  type: 'player' | 'ai' | 'food' | 'hazard' | 'virus' | 'ejected';
+  ownerId?: string; // For split cells and ejected mass
+  mergeTimer?: number; // Ticks until this cell can merge with siblings
   x: number;
   y: number;
   radius: number;
@@ -42,11 +44,8 @@ export interface GameEntity {
   health?: number;
   behavior?: AIBehavior;
   targetId?: string;
-  memory?: {
-    lastAttackerId?: string;
-    fearLevel: number;
-  };
   faction?: number;
+  isVisible?: boolean; 
 }
 
 export interface Biome {
